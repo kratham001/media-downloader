@@ -9,19 +9,33 @@ CORS(app)
 
 def run_downloader(media_url):
     ydl_opts = {
-        # Dynamically grabs active session tokens/cookies from Chrome to bypass paywalls
-        'cookiesfrombrowser': ('chrome',), 
+        # Removed the broken local browser cookie check for the cloud environment
         'format': 'bestvideo+bestaudio/best',
         'merge_output_format': 'mp4',
         'outtmpl': 'downloads/%(title)s_%(id)s.%(ext)s',
+        
+        # Force yt-dlp to accept and try processing generic embedded frames
+        'allow_unplayable_formats': True,
+        'ignoreerrors': False,
+        
+        # Emulate a clean desktop browser to avoid getting served generic 403 walls
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Referer': 'https://vidara.to/',
+        }
     }
     try:
-        print(f"📡 Extracting specific stream: {media_url}")
+        # Optimization: If it's a Vidara page link (/v/), automatically test the underlying player embed (/e/) 
+        if "/v/" in media_url:
+            media_url = media_url.replace("/v/", "/e/")
+            
+        print(f"📡 Extracting optimized stream target: {media_url}")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([media_url])
         print("✅ Download and stitching complete!")
     except Exception as e:
         print(f"❌ Error downloading asset: {e}")
+
 
 @app.route('/download', methods=['POST'])
 def download():
