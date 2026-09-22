@@ -1,0 +1,10 @@
+{
+  "name": "Media Extractor Environment",
+  "forwardPorts": [5000],
+  "portsAttributes": {
+    "5000": {
+      "label": "Flask Downloader Backend",
+      "onAutoForward": "notify"
+    }
+  }
+}
