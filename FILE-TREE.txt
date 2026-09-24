@@ -1,0 +1,15 @@
+├── README.md
+├── __pycache__
+│   ├── config.cpython-314.pyc
+│   └── server.cpython-314.pyc
+├── config.py
+├── core.py
+├── extractor
+│   ├── __init__.py
+│   ├── base.py
+│   ├── generic.py
+│   ├── luluvid.py
+│   ├── playvid.py
+│   └── vidara.py
+├── requirements.txt
+└── server.py

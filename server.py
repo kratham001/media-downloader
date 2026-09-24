@@ -1,12 +1,14 @@
+import importlib
 import os
-import re
-import shutil
-import subprocess
 import threading
 import uuid
 
-import requests
-from flask import Flask, request, jsonify, send_from_directory
+from flask import (
+    Flask,
+    jsonify,
+    request,
+    send_from_directory,
+)
 from flask_cors import CORS
 
 from config import (
@@ -15,249 +17,248 @@ from config import (
     DOWNLOAD_DIR,
 )
 
+from core import (
+    download_media,
+    get_download_path,
+    make_unique_filename,
+)
 
-DOWNLOAD_DIR = os.path.abspath(DOWNLOAD_DIR)
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+from extractor import find_extractor
 
 
 app = Flask(__name__)
 CORS(app)
 
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+DOWNLOAD_DIR = os.path.abspath(
+    DOWNLOAD_DIR
+)
 
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept": "*/*",
-}
+JOBS = {}
 
 
-def make_safe_filename(name):
-    name = re.sub(
-        r'[<>:"/\\|?*\x00-\x1F]',
-        "_",
-        str(name)
-    ).strip()
-
-    return name or "video"
-
-
-def extract_vidara(webpage_url):
-    print(f"[REQUEST] {webpage_url}")
-
-    response = requests.get(
-        webpage_url,
-        headers=HEADERS,
-        timeout=20
-    )
-    response.raise_for_status()
-
-    html = response.text
-
-    print(f"[FETCH] Vidara page loaded ({len(html)} bytes)")
-
-    viderea_match = re.search(
-        r'https?://viderea\.site/e/([A-Za-z0-9_-]+)',
-        html,
-        re.IGNORECASE
-    )
-
-    if not viderea_match:
-        raise RuntimeError(
-            "Could not find the Viderea player."
-        )
-
-    filecode = viderea_match.group(1)
-
-    print(f"[EXTRACTOR] Viderea filecode: {filecode}")
-
-    api_response = requests.post(
-        "https://viderea.site/api/stream",
-        headers={
-            **HEADERS,
-            "Content-Type": "application/json",
-            "Referer": f"https://viderea.site/e/{filecode}",
-            "Origin": "https://viderea.site",
-        },
-        json={
-            "filecode": filecode,
-            "device": "web",
-        },
-        timeout=20
-    )
-
-    api_response.raise_for_status()
-
-    stream_data = api_response.json()
-
-    streaming_url = stream_data.get("streaming_url")
-
-    if not streaming_url:
-        raise RuntimeError(
-            "Viderea API did not return streaming_url."
-        )
-
-    title = make_safe_filename(
-        stream_data.get("title", filecode)
-    )
-
-    print("[MEDIA] Streaming URL resolved:")
-    print(streaming_url)
-
-    return {
-        "filecode": filecode,
-        "title": title,
-        "streaming_url": streaming_url,
-    }
-
-
-def download_media(streaming_url, output_path):
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-    if ".m3u8" in streaming_url:
-        print("[MEDIA] HLS playlist detected.")
-        print(f"[FFMPEG] Saving to: {output_path}")
-
-        result = subprocess.run([
-            "ffmpeg",
-            "-y",
-            "-i", streaming_url,
-            "-c", "copy",
-            output_path
-        ])
-
-        if result.returncode != 0:
-            raise RuntimeError("FFmpeg failed to download the HLS stream.")
-
-    else:
-        print("[MEDIA] Direct media detected.")
-        print(f"[DOWNLOAD] Saving to: {output_path}")
-
-        with requests.get(streaming_url, stream=True, timeout=60) as response:
-            response.raise_for_status()
-
-            with open(output_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-
-    if not os.path.isfile(output_path):
-        raise RuntimeError("Download completed but output file was not created.")
-
-    size = os.path.getsize(output_path)
-
-    if size == 0:
-        raise RuntimeError("Downloaded file is empty.")
-
-    print(f"[SUCCESS] Downloaded {size / (1024 * 1024):.2f} MB")
-
-
-def extraction_worker(webpage_url, filename):
-
+def extraction_and_download_worker(
+    job_id,
+    extracted,
+    filename,
+):
     try:
+        JOBS[job_id]["status"] = "downloading"
+        JOBS[job_id]["message"] = (
+            "Downloading media..."
+        )
 
-        extracted = extract_vidara(webpage_url)
-
-        output_path = os.path.join(
-            DOWNLOAD_DIR,
+        output_path = get_download_path(
             filename
         )
 
         download_media(
-            extracted["streaming_url"],
-            output_path
+            extracted["media_url"],
+            output_path,
+        )
+
+        JOBS[job_id]["status"] = "completed"
+        JOBS[job_id]["message"] = (
+            "Download completed."
+        )
+
+        JOBS[job_id]["download_url"] = (
+            f"/files/{filename}"
         )
 
         print(
-            f"[SUCCESS] File ready: {filename}"
+            f"[SUCCESS] Job {job_id}: "
+            f"{filename}"
         )
 
     except Exception as error:
+        JOBS[job_id]["status"] = "error"
+        JOBS[job_id]["message"] = str(error)
 
         print(
-            f"[ERROR] {type(error).__name__}: {error}"
+            f"[ERROR] Job {job_id}: "
+            f"{type(error).__name__}: "
+            f"{error}"
         )
 
 
-@app.route("/download", methods=["POST"])
+@app.route(
+    "/download",
+    methods=["POST"],
+)
 def download():
-
-    data = request.get_json(silent=True) or {}
+    data = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
 
     media_url = data.get("url")
 
     if not media_url:
         return jsonify({
             "status": "error",
-            "message": "No target URL provided."
-        }), 400
-
-    if "vidara.to" not in media_url.lower():
-        return jsonify({
-            "status": "error",
-            "message": "Vidara is currently the only supported site."
+            "message": (
+                "No target URL provided."
+            ),
         }), 400
 
     job_id = uuid.uuid4().hex[:12]
 
-    filename = f"{job_id}.mp4"
+    JOBS[job_id] = {
+        "status": "extracting",
+        "message": "Finding media...",
+    }
 
-    thread = threading.Thread(
-        target=extraction_worker,
-        args=(media_url, filename),
-        daemon=True
-    )
+    try:
+        extractor = find_extractor(
+            media_url
+        )
 
-    thread.start()
+        JOBS[job_id]["extractor"] = (
+            extractor.name
+        )
 
-    return jsonify({
-        "status": "started",
-        "id": job_id,
-        "filename": filename,
-        "download_url": f"/files/{filename}",
-    }), 202
+        print(
+            f"[JOB {job_id}] "
+            f"Using extractor: "
+            f"{extractor.name}"
+        )
+
+        extracted = extractor.extract(
+            media_url
+        )
+
+        title = (
+            extracted.get("title")
+            or "video"
+        )
+
+        extension = (
+            extracted.get("extension")
+            or "mp4"
+        )
+
+        filename = make_unique_filename(
+            title,
+            extension,
+        )
+
+        JOBS[job_id].update({
+            "title": title,
+            "filename": filename,
+            "status": "queued",
+            "message": (
+                "Media found. "
+                "Download starting..."
+            ),
+        })
+
+        thread = threading.Thread(
+            target=(
+                extraction_and_download_worker
+            ),
+            args=(
+                job_id,
+                extracted,
+                filename,
+            ),
+            daemon=True,
+        )
+
+        thread.start()
+
+        return jsonify({
+            "status": "started",
+            "id": job_id,
+            "title": title,
+            "filename": filename,
+            "download_url": (
+                f"/files/{filename}"
+            ),
+            "status_url": (
+                f"/status/{job_id}"
+            ),
+            "extractor": extractor.name,
+        }), 202
+
+    except Exception as error:
+        JOBS[job_id]["status"] = "error"
+        JOBS[job_id]["message"] = str(error)
+
+        print(
+            f"[ERROR] Job {job_id}: "
+            f"{type(error).__name__}: "
+            f"{error}"
+        )
+
+        return jsonify({
+            "status": "error",
+            "id": job_id,
+            "message": str(error),
+        }), 500
 
 
-@app.route("/files/<filename>", methods=["GET", "HEAD"])
+@app.route(
+    "/status/<job_id>",
+    methods=["GET"],
+)
+def job_status(job_id):
+    job = JOBS.get(job_id)
+
+    if not job:
+        return jsonify({
+            "status": "error",
+            "message": "Job not found.",
+        }), 404
+
+    response = {
+        "status": job.get("status"),
+        "message": job.get("message"),
+        "title": job.get("title"),
+        "filename": job.get("filename"),
+        "extractor": job.get("extractor"),
+        "download_url": job.get(
+            "download_url"
+        ),
+    }
+
+    return jsonify(response)
+
+
+@app.route(
+    "/files/<path:filename>",
+    methods=["GET", "HEAD"],
+)
 def download_file(filename):
-    file_path = os.path.join(DOWNLOAD_DIR, filename)
+    try:
+        file_path = get_download_path(
+            filename
+        )
+    except ValueError:
+        return jsonify({
+            "status": "error",
+            "message": "Invalid filename.",
+        }), 400
 
     if not os.path.isfile(file_path):
         return jsonify({
-            "error": "File not ready",
-            "filename": filename
+            "status": "error",
+            "message": "File not found.",
         }), 404
 
     return send_from_directory(
         DOWNLOAD_DIR,
         filename,
-        as_attachment=True
+        as_attachment=True,
     )
 
 
-@app.route("/", methods=["GET"])
-def health():
-
-    return jsonify({
-        "status": "active",
-        "service": "media-downloader"
-    })
-
-
 if __name__ == "__main__":
-
-    print("----------------------------------------")
-    print(" Media Downloader")
-    print("----------------------------------------")
-    print(f" Server: {SERVER_HOST}:{SERVER_PORT}")
-    print(f" Downloads: {DOWNLOAD_DIR}")
-    print("----------------------------------------")
-
     app.run(
         host=SERVER_HOST,
-        port=SERVER_PORT
+        port=SERVER_PORT,
+        debug=True,
     )
